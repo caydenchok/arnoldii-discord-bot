@@ -1,14 +1,15 @@
 import os
 import logging
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import asyncio
 import time
 import json
 import requests
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict, deque
+import gc
 
 logger = logging.getLogger('arnoldii.deepseek')
 
@@ -21,8 +22,10 @@ class DeepSeekKnowledge(commands.Cog):
         self.api_url = "https://api.deepseek.com/v1/chat/completions"
         self.model = "deepseek-chat"  # Default model
 
-        # Store conversation history for each channel
-        self.conversation_history = defaultdict(lambda: deque(maxlen=10))
+        # Store conversation history for each channel (with a limit on total channels)
+        self.conversation_history = defaultdict(lambda: deque(maxlen=5))
+        self.max_channels = 10  # Limit the number of channels we store history for
+        self.channel_last_used = {}  # Track when each channel was last used
 
         # System prompt for DeepSeek
         self.system_prompt = (
@@ -40,6 +43,9 @@ class DeepSeekKnowledge(commands.Cog):
             'requests_today': 0,
             'last_reset': datetime.now().date()
         }
+
+        # Start memory cleanup task
+        self.memory_cleanup.start()
 
     async def call_deepseek_api(self, messages):
         """Call the DeepSeek API with the given messages"""
@@ -64,7 +70,8 @@ class DeepSeekKnowledge(commands.Cog):
             "model": self.model,
             "messages": messages,
             "temperature": 0.7,
-            "max_tokens": 1000
+            "max_tokens": 800,  # Reduced from 1000 to save memory
+            "stream": False
         }
 
         try:
@@ -97,8 +104,31 @@ class DeepSeekKnowledge(commands.Cog):
             logger.error(f"Error calling DeepSeek API: {e}")
             return f"I encountered an error: {str(e)}"
 
+    def _manage_channel_history(self, channel_id):
+        """Manage channel history to prevent memory bloat"""
+        # Update the last used time for this channel
+        current_time = time.time()
+        self.channel_last_used[channel_id] = current_time
+
+        # If we have too many channels, remove the oldest ones
+        if len(self.conversation_history) > self.max_channels:
+            # Find the least recently used channels
+            channels_by_time = sorted(self.channel_last_used.items(), key=lambda x: x[1])
+            # Remove oldest channels until we're under the limit
+            channels_to_remove = len(self.conversation_history) - self.max_channels
+            for i in range(channels_to_remove):
+                if i < len(channels_by_time):
+                    old_channel = channels_by_time[i][0]
+                    if old_channel in self.conversation_history:
+                        del self.conversation_history[old_channel]
+                        del self.channel_last_used[old_channel]
+                        logger.info(f"Removed history for channel {old_channel} to save memory")
+
     def _format_conversation(self, channel_id, new_user_message=None):
         """Format the conversation history for the AI"""
+        # Manage channel history first
+        self._manage_channel_history(channel_id)
+
         # Start with the system prompt
         formatted = [{"role": "system", "content": self.system_prompt}]
 
@@ -116,15 +146,26 @@ class DeepSeekKnowledge(commands.Cog):
 
     async def send_response(self, ctx, response):
         """Send a response, splitting into chunks if necessary"""
+        # Limit extremely long responses to save memory
+        if len(response) > 6000:
+            response = response[:6000] + "... (response truncated to save memory)"
+
         if len(response) > 1900:
-            chunks = [response[i:i+1900] for i in range(0, len(response), 1900)]
-            for i, chunk in enumerate(chunks):
+            # Process one chunk at a time to avoid storing all chunks in memory
+            for i in range(0, len(response), 1900):
+                chunk = response[i:i+1900]
                 if i == 0:
                     await ctx.send(chunk)
                 else:
                     await ctx.send(f"(continued) {chunk}")
+                # Small delay to avoid rate limiting
+                await asyncio.sleep(0.5)
         else:
             await ctx.send(response)
+
+        # Force garbage collection after sending large responses
+        if len(response) > 3000:
+            gc.collect()
 
     @commands.Cog.listener()
     async def on_message(self, message):
@@ -133,8 +174,8 @@ class DeepSeekKnowledge(commands.Cog):
         if message.author == self.bot.user:
             return
 
-        # Don't respond to commands (they start with !)
-        if message.content.startswith('!'):
+        # Don't respond to commands (they start with the bot's prefix)
+        if message.content.startswith('a!'):
             return
 
         # Check if the bot is mentioned or called by name
@@ -220,6 +261,59 @@ class DeepSeekKnowledge(commands.Cog):
             await ctx.send(embed=embed)
         else:
             await ctx.send("You need administrator permissions to check API usage.")
+
+    def cog_unload(self):
+        """Clean up when the cog is unloaded"""
+        # Cancel the memory cleanup task
+        self.memory_cleanup.cancel()
+        # Clear conversation history to free memory
+        self.conversation_history.clear()
+        self.channel_last_used.clear()
+        # Force garbage collection
+        gc.collect()
+        logger.info("DeepSeek knowledge cog unloaded and memory cleaned up")
+
+    @tasks.loop(minutes=30)
+    async def memory_cleanup(self):
+        """Periodically clean up memory to prevent leaks"""
+        try:
+            # Remove old channel histories
+            current_time = time.time()
+            channels_to_remove = []
+
+            # Find channels that haven't been used in the last 2 hours
+            for channel_id, last_used in self.channel_last_used.items():
+                if current_time - last_used > 7200:  # 2 hours in seconds
+                    channels_to_remove.append(channel_id)
+
+            # Remove the old channels
+            for channel_id in channels_to_remove:
+                if channel_id in self.conversation_history:
+                    del self.conversation_history[channel_id]
+                    del self.channel_last_used[channel_id]
+
+            if channels_to_remove:
+                logger.info(f"Memory cleanup: removed {len(channels_to_remove)} inactive channels")
+
+            # Force garbage collection
+            gc.collect()
+
+            # Log memory usage if possible
+            try:
+                import psutil
+                process = psutil.Process()
+                memory_info = process.memory_info()
+                logger.info(f"Current memory usage: {memory_info.rss / 1024 / 1024:.2f} MB")
+            except ImportError:
+                pass  # psutil not available
+
+        except Exception as e:
+            logger.error(f"Error during memory cleanup: {e}")
+
+    @memory_cleanup.before_loop
+    async def before_memory_cleanup(self):
+        """Wait until the bot is ready before starting the cleanup task"""
+        await self.bot.wait_until_ready()
 
 async def setup(bot):
     await bot.add_cog(DeepSeekKnowledge(bot))

@@ -45,10 +45,10 @@ python main.py
 
 ### Commands
 
-- `!hello` - Test if the bot is working
-- `!chat <message>` - Chat with Arnoldii
-- `!clear` - Clear the conversation history for the current channel
-- `!usage` - Check DeepSeek API usage (admin only)
+- `a!hello` - Test if the bot is working
+- `a!chat <message>` - Chat with Arnoldii
+- `a!clear` - Clear the conversation history for the current channel
+- `a!usage` - Check DeepSeek API usage (admin only)
 
 ### Natural Interaction
 
