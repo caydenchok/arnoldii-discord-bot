@@ -68,7 +68,8 @@ class DeepSeekKnowledge(commands.Cog):
         }
 
         try:
-            async def _make_request():
+            # Define a synchronous function for the request
+            def _make_request():
                 response = requests.post(
                     self.api_url,
                     headers=headers,
@@ -77,7 +78,9 @@ class DeepSeekKnowledge(commands.Cog):
                 )
                 return response.json()
 
-            response_json = await asyncio.to_thread(_make_request)
+            # Run the request in a separate thread to avoid blocking
+            loop = asyncio.get_event_loop()
+            response_json = await loop.run_in_executor(None, _make_request)
 
             # Track token usage if available in the response
             if 'usage' in response_json and 'total_tokens' in response_json['usage']:
@@ -99,8 +102,9 @@ class DeepSeekKnowledge(commands.Cog):
         # Start with the system prompt
         formatted = [{"role": "system", "content": self.system_prompt}]
 
-        # Add conversation history
-        for speaker, message in self.conversation_history[channel_id]:
+        # Add conversation history - convert to list to avoid iteration issues
+        history_list = list(self.conversation_history[channel_id])
+        for speaker, message in history_list:
             role = "assistant" if speaker == "Arnoldii" else "user"
             formatted.append({"role": role, "content": message})
 
