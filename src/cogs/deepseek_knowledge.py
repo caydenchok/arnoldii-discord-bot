@@ -217,5 +217,5 @@ class DeepSeekKnowledge(commands.Cog):
         else:
             await ctx.send("You need administrator permissions to check API usage.")
 
-def setup(bot):
-    bot.add_cog(DeepSeekKnowledge(bot))
+async def setup(bot):
+    await bot.add_cog(DeepSeekKnowledge(bot))
